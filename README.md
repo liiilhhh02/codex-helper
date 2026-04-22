@@ -97,6 +97,9 @@ Useful flags:
 codex-history --no-open
 codex-history --port 9876
 codex-history --build
+codex-history --reindex
+codex-history resume
+codex-history resume --print-only --limit 20
 ```
 
 For `codex-profiles`:

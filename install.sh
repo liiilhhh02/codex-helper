@@ -40,7 +40,7 @@ fi
 
 cat > "${TARGET_WRAPPER}" <<'EOF'
 #!/usr/bin/env bash
-exec python3 "$HOME/.local/share/codex-history/codex_history.py" --serve "$@"
+exec python3 "$HOME/.local/share/codex-history/codex_history.py" "$@"
 EOF
 
 chmod +x "${TARGET_WRAPPER}"

@@ -26,6 +26,7 @@ SESSIONS_DIR = CODEX_DIR / "sessions"
 ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
 OUTPUT_DIR = CODEX_DIR / "memories" / "shared_history"
 OUTPUT_HTML = OUTPUT_DIR / "index.html"
+JUNK_AGE_DAYS = 90
 
 CSWITCH_STATE_FILE = Path.home() / ".local" / "state" / "cswitch" / "current_profile"
 CSWITCH_PROFILES_FILE = CODEX_DIR / "cswitch_profiles.json"
@@ -330,6 +331,44 @@ def looks_like_injected_context(role: str, text: str) -> bool:
     return stripped.startswith("# AGENTS.md instructions") or stripped.startswith("<environment_context>")
 
 
+def iso_to_epoch_seconds(value: str) -> int:
+    value = value.strip()
+    if not value:
+        return 0
+    normalized = value
+    if " " in normalized and "T" not in normalized:
+        normalized = normalized.replace(" ", "T")
+    if normalized.endswith("Z"):
+        normalized = normalized[:-1] + "+00:00"
+    try:
+        return int(dt.datetime.fromisoformat(normalized).timestamp())
+    except ValueError:
+        return 0
+
+
+def source_is_subagent(source: object) -> bool:
+    if isinstance(source, dict):
+        return "subagent" in source
+    if isinstance(source, str):
+        lowered = source.lower()
+        return "subagent" in lowered or "guardian" in lowered
+    return False
+
+
+def compute_junk_flags(*, is_subagent: bool, user_count: int, assistant_count: int, assistant_final_count: int, updated_epoch: int) -> list[str]:
+    flags: list[str] = []
+    if is_subagent:
+        flags.append("subagent")
+    if user_count < 3:
+        flags.append("short")
+    if assistant_count == 0 or assistant_final_count == 0:
+        flags.append("bad_reply")
+    cutoff_epoch = int((dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=JUNK_AGE_DAYS)).timestamp())
+    if updated_epoch and updated_epoch < cutoff_epoch:
+        flags.append("old")
+    return flags
+
+
 def parse_session(path: Path, thread_meta: dict | None) -> dict | None:
     session_meta = {}
     transcript: list[dict[str, str]] = []
@@ -389,7 +428,8 @@ def parse_session(path: Path, thread_meta: dict | None) -> dict | None:
     title = stringify((thread_meta or {}).get("title") or session_meta.get("title") or "Untitled thread")
     cwd = stringify((thread_meta or {}).get("cwd") or (session_meta.get("cwd") if isinstance(session_meta, dict) else "") or "")
     provider = stringify((thread_meta or {}).get("model_provider") or (session_meta.get("model_provider") if isinstance(session_meta, dict) else "") or "")
-    source = stringify((thread_meta or {}).get("source") or (session_meta.get("source") if isinstance(session_meta, dict) else "") or "")
+    raw_source = (thread_meta or {}).get("source") or (session_meta.get("source") if isinstance(session_meta, dict) else "") or ""
+    source = stringify(raw_source)
     updated_iso = stringify((thread_meta or {}).get("updated_iso") or "")
     if not updated_iso and record_timestamp:
         updated_iso = record_timestamp.replace("T", " ").replace("Z", "")
@@ -408,6 +448,19 @@ def parse_session(path: Path, thread_meta: dict | None) -> dict | None:
     elif assistant_messages:
         preview = assistant_messages[0].splitlines()[0][:180]
 
+    user_count = len(user_messages)
+    assistant_count = len(assistant_messages)
+    assistant_final_count = sum(1 for item in transcript if item["role"] == "assistant:final_answer")
+    updated_epoch = iso_to_epoch_seconds(updated_iso)
+    is_subagent = source_is_subagent(raw_source)
+    junk_flags = compute_junk_flags(
+        is_subagent=is_subagent,
+        user_count=user_count,
+        assistant_count=assistant_count,
+        assistant_final_count=assistant_final_count,
+        updated_epoch=updated_epoch,
+    )
+
     search_parts = [title, cwd, provider, source, preview, *user_messages[:4], *assistant_messages[:2]]
     search_blob = "\n".join(stringify(part) for part in search_parts if stringify(part)).lower()
 
@@ -418,14 +471,21 @@ def parse_session(path: Path, thread_meta: dict | None) -> dict | None:
         "provider": provider,
         "source": source,
         "updated_iso": updated_iso,
+        "updated_epoch": updated_epoch,
         "path": str(path),
         "preview": preview,
         "search_blob": search_blob,
         "transcript": transcript,
+        "is_subagent": is_subagent,
+        "user_count": user_count,
+        "assistant_count": assistant_count,
+        "assistant_final_count": assistant_final_count,
+        "junk_flags": junk_flags,
+        "is_junk": bool(junk_flags),
     }
 
 
-def collect_sessions() -> list[dict]:
+def collect_sessions(*, include_subagents: bool = True) -> list[dict]:
     thread_map = load_threads()
     sessions: list[dict] = []
     seen_ids: set[str] = set()
@@ -446,6 +506,8 @@ def collect_sessions() -> list[dict]:
         if session["id"] in seen_ids:
             continue
         seen_ids.add(session["id"])
+        if not include_subagents and session["is_subagent"]:
+            continue
         sessions.append(session)
 
     sessions.sort(key=lambda item: item["updated_iso"], reverse=True)
@@ -479,9 +541,13 @@ def render_session_card(session: dict, interactive: bool) -> str:
 
     controls = ""
     if interactive:
+        junk_labels = " ".join(f'<span class="tag junk">{html.escape(flag)}</span>' for flag in session["junk_flags"])
+        subagent_label = '<span class="tag muted">subagent</span>' if session["is_subagent"] else ""
         controls = "\n".join(
             [
                 '<div class="controls">',
+                f'<label class="pick"><input type="checkbox" class="session-pick" data-session-id="{html.escape(session["id"], quote=True)}" /> Select</label>',
+                f'<div class="control-tags">{junk_labels}{subagent_label}</div>',
                 f'<button type="button" class="neutral rename-button" data-session-id="{html.escape(session["id"], quote=True)}">Rename title</button>',
                 f'<form method="post" action="/delete" class="delete-form" data-session-id="{html.escape(session["id"], quote=True)}">',
                 f'<input type="hidden" name="session_id" value="{html.escape(session["id"], quote=True)}" />',
@@ -494,16 +560,19 @@ def render_session_card(session: dict, interactive: bool) -> str:
     data_search = html.escape(session["search_blob"], quote=True)
     meta = " | ".join(part for part in [session["updated_iso"], session["provider"], session["source"], session["cwd"]] if part)
     body = "".join(transcript_html) or '<div class="empty">No transcript captured.</div>'
+    junk_value = "1" if session["is_junk"] else "0"
+    subagent_value = "1" if session["is_subagent"] else "0"
 
     return "\n".join(
         [
-            f'<details class="session" data-search="{data_search}" data-session-id="{html.escape(session["id"], quote=True)}">',
+            f'<details class="session" data-search="{data_search}" data-session-id="{html.escape(session["id"], quote=True)}" data-is-junk="{junk_value}" data-is-subagent="{subagent_value}">',
             "<summary>",
             f'<span class="title" data-role="title">{html.escape(session["title"])}</span>',
             f'<span class="meta">{html.escape(meta)}</span>',
             "</summary>",
             f'<div class="preview">{html.escape(session["preview"])}</div>' if session["preview"] else '<div class="preview muted">No preview</div>',
             f'<div class="path">{html.escape(session["path"])}</div>',
+            f'<div class="path">run <code>codex resume {html.escape(session["id"])}</code></div>',
             controls,
             body,
             "</details>",
@@ -638,13 +707,27 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
     }}
     .controls {{
       display: flex;
-      justify-content: flex-end;
+      justify-content: space-between;
       align-items: center;
       gap: 10px;
+      flex-wrap: wrap;
       margin: 8px 0 14px;
+    }}
+    .control-tags {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-left: auto;
     }}
     form {{
       margin: 0;
+    }}
+    .pick {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
     }}
     .neutral, .danger {{
       border-radius: 8px;
@@ -700,6 +783,42 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
     .hidden {{
       display: none;
     }}
+    .toolbar {{
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      align-items: center;
+      margin-top: 12px;
+    }}
+    .toolbar label {{
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .tag {{
+      display: inline-flex;
+      align-items: center;
+      padding: 3px 8px;
+      border-radius: 999px;
+      border: 1px solid rgba(56, 189, 248, 0.35);
+      background: rgba(3, 105, 161, 0.16);
+      color: #dbeafe;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .tag.junk {{
+      border-color: rgba(248, 113, 113, 0.35);
+      background: rgba(127, 29, 29, 0.3);
+      color: #fecaca;
+    }}
+    .tag.muted {{
+      border-color: rgba(148, 163, 184, 0.35);
+      background: rgba(30, 41, 59, 0.55);
+      color: #cbd5e1;
+    }}
   </style>
 </head>
 <body>
@@ -713,6 +832,16 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
 	      </div>
 	      <input id="search" type="search" placeholder="Search title, cwd, provider, prompt, or reply..." />
 	      <div class="stats"><span id="visible-count">{len(sessions)}</span> / {len(sessions)} sessions visible</div>
+          <div class="toolbar">
+            <label><input id="toggle-subagents" type="checkbox" /> Show subagent sessions</label>
+            <label><input id="toggle-junk-only" type="checkbox" /> Show junk only</label>
+            <button id="select-visible" type="button" class="neutral">Select visible</button>
+            <button id="clear-selection" type="button" class="neutral">Clear selection</button>
+            <button id="select-junk" type="button" class="neutral">Select junk</button>
+            <button id="delete-selected" type="button" class="danger">Delete selected</button>
+            <button id="delete-junk" type="button" class="danger">Delete junk</button>
+            <span class="meta"><span id="selected-count">0</span> selected</span>
+          </div>
 	      {flash_html}
 	    </div>
 	  </div>
@@ -723,7 +852,10 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
     const input = document.getElementById('search');
     const sessions = Array.from(document.querySelectorAll('.session'));
     const visibleCount = document.getElementById('visible-count');
+    const selectedCount = document.getElementById('selected-count');
     const flash = document.getElementById('flash');
+    const toggleSubagents = document.getElementById('toggle-subagents');
+    const toggleJunkOnly = document.getElementById('toggle-junk-only');
 
     function setFlash(message, isError = false) {{
       flash.textContent = message;
@@ -735,14 +867,20 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
 
     function applyFilter() {{
       const q = input.value.trim().toLowerCase();
+      const showSubagents = toggleSubagents.checked;
+      const junkOnly = toggleJunkOnly.checked;
       let count = 0;
       for (const el of sessions) {{
         const hay = el.dataset.search || '';
-        const show = !q || hay.includes(q);
+        const matchesQuery = !q || hay.includes(q);
+        const matchesSubagent = showSubagents || el.dataset.isSubagent !== '1';
+        const matchesJunk = !junkOnly || el.dataset.isJunk === '1';
+        const show = matchesQuery && matchesSubagent && matchesJunk;
         el.classList.toggle('hidden', !show);
         if (show) count += 1;
       }}
       visibleCount.textContent = String(count);
+      updateSelectedCount();
     }}
 
     function updateSessionSearch(card, newTitle) {{
@@ -756,7 +894,100 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
       }}
     }}
 
+    function getSelectedIds() {{
+      return sessions
+        .map((card) => card.querySelector('.session-pick'))
+        .filter((box) => box && box.checked)
+        .map((box) => box.dataset.sessionId || '')
+        .filter(Boolean);
+    }}
+
+    function updateSelectedCount() {{
+      selectedCount.textContent = String(getSelectedIds().length);
+    }}
+
+    function visibleCards() {{
+      return sessions.filter((card) => !card.classList.contains('hidden'));
+    }}
+
+    async function deleteIds(ids, label) {{
+      if (!ids.length) {{
+        setFlash(`No sessions selected for ${{label}}`, true);
+        return;
+      }}
+      if (!window.confirm(`${{label}} ${{ids.length}} session(s)?`)) {{
+        return;
+      }}
+
+      try {{
+        const response = await fetch('/bulk-delete', {{
+          method: 'POST',
+          headers: {{
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }},
+          body: JSON.stringify({{ session_ids: ids }})
+        }});
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {{
+          throw new Error(payload.flash || `Bulk delete failed (${{response.status}})`);
+        }}
+
+        for (const id of ids) {{
+          const card = sessions.find((item) => item.dataset.sessionId === id);
+          if (!card) continue;
+          card.remove();
+          const idx = sessions.indexOf(card);
+          if (idx >= 0) {{
+            sessions.splice(idx, 1);
+          }}
+        }}
+        applyFilter();
+        setFlash(payload.flash || `Deleted ${{ids.length}} session(s)`);
+      }} catch (error) {{
+        setFlash(error.message || 'Bulk delete failed', true);
+      }}
+    }}
+
     input.addEventListener('input', applyFilter);
+    toggleSubagents.addEventListener('change', applyFilter);
+    toggleJunkOnly.addEventListener('change', applyFilter);
+
+    document.getElementById('select-visible').addEventListener('click', () => {{
+      for (const card of visibleCards()) {{
+        const box = card.querySelector('.session-pick');
+        if (box) box.checked = true;
+      }}
+      updateSelectedCount();
+    }});
+
+    document.getElementById('clear-selection').addEventListener('click', () => {{
+      for (const card of sessions) {{
+        const box = card.querySelector('.session-pick');
+        if (box) box.checked = false;
+      }}
+      updateSelectedCount();
+    }});
+
+    document.getElementById('select-junk').addEventListener('click', () => {{
+      for (const card of visibleCards()) {{
+        const box = card.querySelector('.session-pick');
+        if (box) box.checked = card.dataset.isJunk === '1';
+      }}
+      updateSelectedCount();
+    }});
+
+    document.getElementById('delete-selected').addEventListener('click', async () => {{
+      await deleteIds(getSelectedIds(), 'Delete');
+    }});
+
+    document.getElementById('delete-junk').addEventListener('click', async () => {{
+      const ids = visibleCards()
+        .filter((card) => card.dataset.isJunk === '1')
+        .map((card) => card.dataset.sessionId || '')
+        .filter(Boolean);
+      await deleteIds(ids, 'Delete junk');
+    }});
 
     for (const button of document.querySelectorAll('.rename-button')) {{
       button.addEventListener('click', async () => {{
@@ -871,6 +1102,12 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
         }}
       }});
     }}
+
+    for (const box of document.querySelectorAll('.session-pick')) {{
+      box.addEventListener('change', updateSelectedCount);
+    }}
+
+    applyFilter();
   </script>
 </body>
 </html>
@@ -1271,11 +1508,130 @@ def delete_session(session_id: str) -> dict[str, int]:
     }
 
 
+def delete_sessions(session_ids: list[str]) -> dict[str, int]:
+    totals = {"deleted_files": 0, "removed_index": 0, "removed_history": 0, "deleted_sessions": 0}
+    seen: set[str] = set()
+    for session_id in session_ids:
+        session_id = session_id.strip()
+        if not session_id or session_id in seen:
+            continue
+        seen.add(session_id)
+        result = delete_session(session_id)
+        totals["deleted_files"] += result["deleted_files"]
+        totals["removed_index"] += result["removed_index"]
+        totals["removed_history"] += result["removed_history"]
+        totals["deleted_sessions"] += 1
+    return totals
+
+
 def build_static_html(output: Path) -> tuple[Path, int]:
     output.parent.mkdir(parents=True, exist_ok=True)
     sessions = collect_sessions()
     output.write_text(render_html(sessions, interactive=False), encoding="utf-8")
     return output, len(sessions)
+
+
+def rebuild_session_index(*, write: bool) -> tuple[int, int]:
+    existing_titles = load_threads()
+    sessions = collect_sessions()
+    rows: list[dict[str, str]] = []
+
+    for session in sessions:
+        session_id = stringify(session.get("id")).strip()
+        if not session_id:
+            continue
+        existing = existing_titles.get(session_id, {})
+        thread_name = stringify(existing.get("title") or session.get("title") or "Untitled thread").strip()
+        updated_at = stringify(existing.get("updated_iso") or session.get("updated_iso") or "").strip()
+        if updated_at and " " in updated_at and "T" not in updated_at:
+            updated_at = updated_at.replace(" ", "T")
+            if not updated_at.endswith("Z"):
+                updated_at += "Z"
+        rows.append(
+            {
+                "id": session_id,
+                "thread_name": thread_name or "Untitled thread",
+                "updated_at": updated_at,
+            }
+        )
+
+    current_count = len(existing_titles)
+    rebuilt_count = len(rows)
+    if write:
+        ensure_parent_dir(SESSION_INDEX)
+        with SESSION_INDEX.open("w", encoding="utf-8") as handle:
+            for row in rows:
+                handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return current_count, rebuilt_count
+
+
+def filter_sessions_for_query(sessions: list[dict], query: str) -> list[dict]:
+    query = query.strip().lower()
+    if not query:
+        return sessions
+    return [session for session in sessions if query in session["search_blob"] or query in session["id"].lower()]
+
+
+def launch_codex_resume(session_id: str) -> int:
+    try:
+        return subprocess.run(["codex", "resume", session_id], check=False).returncode
+    except FileNotFoundError:
+        print("codex command not found on PATH", file=sys.stderr)
+        return 1
+
+
+def main_resume(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = argparse.ArgumentParser(description="Choose a saved Codex history entry and run codex resume <id>")
+    parser.add_argument("query", nargs="*", help="Optional search terms to narrow the history list")
+    parser.add_argument("--include-subagents", action="store_true", help="Include subagent sessions in the picker")
+    parser.add_argument("--include-junk", action="store_true", help="Include junk sessions in the picker")
+    parser.add_argument("--limit", type=int, default=30, help="Maximum number of rows to show (default: 30)")
+    parser.add_argument("--print-only", action="store_true", help="Print matching sessions without launching codex resume")
+    args = parser.parse_args(argv)
+
+    sessions = collect_sessions(include_subagents=args.include_subagents)
+    if not args.include_junk:
+        sessions = [session for session in sessions if not session["is_junk"]]
+    sessions = filter_sessions_for_query(sessions, " ".join(args.query))
+
+    if not sessions:
+        print("No matching sessions.")
+        return 1
+
+    shown = sessions[: max(args.limit, 1)]
+    for idx, session in enumerate(shown, start=1):
+        flags: list[str] = []
+        if session["is_subagent"]:
+            flags.append("subagent")
+        if session["is_junk"]:
+            flags.append("junk")
+        suffix = f" [{' '.join(flags)}]" if flags else ""
+        print(f"{idx:>2}. {session['updated_iso']} | {session['title']}{suffix}")
+        print(f"    id={session['id']} | cwd={session['cwd'] or '-'}")
+
+    if args.print_only:
+        return 0
+
+    if not sys.stdin.isatty():
+        print("Interactive selection requires a terminal. Re-run with --print-only or in a TTY.", file=sys.stderr)
+        return 1
+
+    choice = input("Resume which session? Enter number or exact session id: ").strip()
+    if not choice:
+        print("Cancelled.")
+        return 1
+
+    if choice.isdigit():
+        index = int(choice) - 1
+        if index < 0 or index >= len(shown):
+            print("Invalid selection.", file=sys.stderr)
+            return 1
+        session_id = shown[index]["id"]
+    else:
+        session_id = choice
+
+    return launch_codex_resume(session_id)
 
 
 class HistoryHandler(BaseHTTPRequestHandler):
@@ -1359,6 +1715,24 @@ class HistoryHandler(BaseHTTPRequestHandler):
                 self.write_json({"ok": False, "flash": f"Apply failed: {exc}"}, status=400)
                 return
             self.write_json({"ok": True, "flash": f"Applied profile: {profile}"})
+            return
+
+        if parsed.path == "/bulk-delete":
+            data = self.read_json_body()
+            raw_ids = data.get("session_ids", [])
+            if not isinstance(raw_ids, list):
+                self.write_json({"ok": False, "flash": "session_ids must be a list"}, status=400)
+                return
+            session_ids = [str(item).strip() for item in raw_ids if str(item).strip()]
+            if not session_ids:
+                self.write_json({"ok": False, "flash": "No session ids provided"}, status=400)
+                return
+            result = delete_sessions(session_ids)
+            flash = (
+                f"Deleted {result['deleted_sessions']} sessions: files={result['deleted_files']}, "
+                f"session_index rows={result['removed_index']}, history rows={result['removed_history']}"
+            )
+            self.write_json({"ok": True, "flash": flash})
             return
 
         if parsed.path not in {"/delete", "/rename"}:
@@ -1468,9 +1842,19 @@ def main_history(argv: list[str]) -> int:
     parser.add_argument("--build", action="store_true", help="Build a static HTML snapshot instead of serving")
     parser.add_argument("--output", default=str(OUTPUT_HTML), help="Output HTML path for --build")
     parser.add_argument("--serve", action="store_true", help="Serve an interactive local UI")
+    parser.add_argument("--reindex", action="store_true", help="Rebuild ~/.codex/session_index.jsonl from rollout files")
+    parser.add_argument("--dry-run", action="store_true", help="Preview --reindex changes without writing")
     parser.add_argument("--port", type=int, default=8765, help="Port for --serve (default: 8765)")
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
     args = parser.parse_args(argv)
+
+    if args.reindex:
+        before, after = rebuild_session_index(write=not args.dry_run)
+        action = "would rebuild" if args.dry_run else "rebuilt"
+        print(f"{action} {SESSION_INDEX}")
+        print(f"rows before: {before}")
+        print(f"rows after:  {after}")
+        return 0
 
     if args.build:
         output, count = build_static_html(Path(args.output).expanduser())
@@ -1541,6 +1925,8 @@ def main(argv: list[str] | None = None) -> int:
         return main_profiles(argv[1:])
     if argv and argv[0] == "cswitch":
         return main_cswitch(argv[1:])
+    if argv and argv[0] == "resume":
+        return main_resume(argv[1:])
     if argv and argv[0] == "history":
         return main_history(argv[1:])
     return main_history(argv)

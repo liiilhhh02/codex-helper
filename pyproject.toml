@@ -7,16 +7,17 @@ name = "codex-history"
 version = "0.1.0"
 description = "Local Codex history viewer and manager"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.8"
 authors = [
   { name = "liiilhhh" }
 ]
-license = "MIT"
+license = { text = "MIT" }
 classifiers = [
   "Environment :: Console",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.8",
   "Programming Language :: Python :: 3 :: Only",
   "Topic :: Utilities",
 ]
