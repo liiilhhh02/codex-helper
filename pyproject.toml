@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-history"
+version = "0.1.0"
+description = "Local Codex history viewer and manager"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "liiilhhh" }
+]
+license = "MIT"
+classifiers = [
+  "Environment :: Console",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Topic :: Utilities",
+]
+
+[project.urls]
+Homepage = "https://example.com/codex-history"
+
+[project.scripts]
+codex-history = "codex_history.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
