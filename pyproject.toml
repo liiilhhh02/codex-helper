@@ -26,6 +26,8 @@ Homepage = "https://example.com/codex-history"
 
 [project.scripts]
 codex-history = "codex_history.cli:main"
+cswitch = "codex_history.cli:main_cswitch"
+codex-profiles = "codex_history.cli:main_profiles"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

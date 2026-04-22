@@ -6,6 +6,8 @@ import argparse
 import datetime as dt
 import html
 import json
+import os
+import re
 import subprocess
 import threading
 import urllib.parse
@@ -13,6 +15,7 @@ import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+import sys
 from typing import Iterable
 
 
@@ -23,6 +26,245 @@ SESSIONS_DIR = CODEX_DIR / "sessions"
 ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
 OUTPUT_DIR = CODEX_DIR / "memories" / "shared_history"
 OUTPUT_HTML = OUTPUT_DIR / "index.html"
+
+CSWITCH_STATE_FILE = Path.home() / ".local" / "state" / "cswitch" / "current_profile"
+CSWITCH_PROFILES_FILE = CODEX_DIR / "cswitch_profiles.json"
+DEFAULT_PROFILE_ORDER = ["dashuichi", "codex", "tokenflux"]
+
+
+def ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def safe_write_text(path: Path, content: str, *, mode: int | None = None) -> None:
+    ensure_parent_dir(path)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(content, encoding="utf-8")
+    if mode is not None:
+        os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def safe_write_json(path: Path, obj: object, *, mode: int | None = None) -> None:
+    safe_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n", mode=mode)
+
+
+def load_json(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def validate_profiles_data(data: dict) -> tuple[list[str], dict[str, dict]]:
+    if not isinstance(data, dict):
+        raise ValueError("profiles JSON must be an object")
+    order = data.get("order", DEFAULT_PROFILE_ORDER)
+    profiles = data.get("profiles", {})
+    if not isinstance(order, list) or not all(isinstance(x, str) and x.strip() for x in order):
+        raise ValueError("profiles JSON 'order' must be a list of strings")
+    if not isinstance(profiles, dict):
+        raise ValueError("profiles JSON 'profiles' must be an object")
+    validated: dict[str, dict] = {}
+    for name in order:
+        item = profiles.get(name)
+        if not isinstance(item, dict):
+            raise ValueError(f"missing profile: {name}")
+        base_url = item.get("base_url")
+        api_key = item.get("api_key")
+        model = item.get("model")
+        if not isinstance(base_url, str):
+            raise ValueError(f"{name}.base_url must be a string")
+        if not isinstance(api_key, str):
+            raise ValueError(f"{name}.api_key must be a string")
+        if model is not None and (not isinstance(model, str) or not model.strip()):
+            raise ValueError(f"{name}.model must be a string when present")
+        validated[name] = {"base_url": base_url.strip(), "api_key": api_key.strip()}
+        if isinstance(model, str) and model.strip():
+            validated[name]["model"] = model.strip()
+    return [x.strip() for x in order], validated
+
+
+def read_api_key_from_auth(path: Path) -> str:
+    if not path.exists():
+        return ""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return ""
+    if not isinstance(data, dict):
+        return ""
+    value = data.get("OPENAI_API_KEY")
+    return value.strip() if isinstance(value, str) else ""
+
+
+def read_base_url_from_config(path: Path) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r'^\s*base_url\s*=\s*"([^"]+)"\s*$', text, flags=re.M)
+    return match.group(1).strip() if match else ""
+
+
+def read_model_from_config(path: Path) -> str:
+    if not path.exists():
+        return ""
+    text = path.read_text(encoding="utf-8")
+    match = re.search(r'^\s*model\s*=\s*"([^"]+)"\s*$', text, flags=re.M)
+    return match.group(1).strip() if match else ""
+
+
+def resolve_alt_auth(codex_dir: Path) -> Path | None:
+    auth1 = codex_dir / "auth1.json"
+    suth1 = codex_dir / "suth1.json"
+    if auth1.exists() and not suth1.exists():
+        return auth1
+    if suth1.exists() and not auth1.exists():
+        return suth1
+    return None
+
+
+def read_current_profile(order: list[str]) -> str:
+    if not CSWITCH_STATE_FILE.exists():
+        return order[0] if order else DEFAULT_PROFILE_ORDER[0]
+    value = CSWITCH_STATE_FILE.read_text(encoding="utf-8").strip()
+    return value if value in order else (order[0] if order else DEFAULT_PROFILE_ORDER[0])
+
+
+def write_current_profile(profile: str) -> None:
+    ensure_parent_dir(CSWITCH_STATE_FILE)
+    safe_write_text(CSWITCH_STATE_FILE, profile + "\n")
+
+
+def infer_profiles_from_existing() -> dict:
+    codex_dir = CODEX_DIR
+    primary_auth = codex_dir / "auth.json"
+    primary_config = codex_dir / "config.toml"
+    alt_auth = resolve_alt_auth(codex_dir)
+    alt_config = codex_dir / "config1.toml"
+
+    state_value = CSWITCH_STATE_FILE.read_text(encoding="utf-8").strip() if CSWITCH_STATE_FILE.exists() else ""
+    current_name = state_value if state_value else "primary"
+    other_name = "alt"
+    if current_name in {"dashuichi", "codex"}:
+        other_name = "dashuichi" if current_name == "codex" else "codex"
+
+    profiles: dict[str, dict[str, str]] = {}
+
+    base_url = read_base_url_from_config(primary_config)
+    api_key = read_api_key_from_auth(primary_auth)
+    model = read_model_from_config(primary_config)
+    if base_url and api_key:
+        profiles[current_name] = {"base_url": base_url, "api_key": api_key}
+        if model:
+            profiles[current_name]["model"] = model
+
+    if alt_auth and alt_config.exists():
+        base_url = read_base_url_from_config(alt_config)
+        api_key = read_api_key_from_auth(alt_auth)
+        model = read_model_from_config(alt_config)
+        if base_url and api_key:
+            profiles[other_name] = {"base_url": base_url, "api_key": api_key}
+            if model:
+                profiles[other_name]["model"] = model
+
+    # Optional tokenflux canonical files (created by some setups)
+    tokenflux_auth = codex_dir / "auth.tokenflux.json"
+    tokenflux_config = codex_dir / "config.tokenflux.toml"
+    if tokenflux_auth.exists() and tokenflux_config.exists():
+        base_url = read_base_url_from_config(tokenflux_config)
+        api_key = read_api_key_from_auth(tokenflux_auth)
+        model = read_model_from_config(tokenflux_config)
+        if base_url and api_key:
+            profiles["tokenflux"] = {"base_url": base_url, "api_key": api_key}
+            if model:
+                profiles["tokenflux"]["model"] = model
+
+    order = [name for name in DEFAULT_PROFILE_ORDER if name in profiles]
+    if current_name in profiles and current_name not in order:
+        order.insert(0, current_name)
+    if other_name in profiles and other_name not in order:
+        order.append(other_name)
+
+    if not order:
+        order = [current_name]
+        profiles[current_name] = {"base_url": "", "api_key": ""}
+
+    return {"order": order, "profiles": profiles}
+
+
+def ensure_profiles_file() -> dict:
+    data = load_json(CSWITCH_PROFILES_FILE)
+    if data:
+        return data
+    inferred = infer_profiles_from_existing()
+    safe_write_json(CSWITCH_PROFILES_FILE, inferred, mode=0o600)
+    return inferred
+
+
+def render_next_config(template_text: str, *, next_profile: str, base_url: str, model: str | None) -> str:
+    text = template_text
+    text = re.sub(
+        r'^\s*model_provider\s*=\s*"[^"]+"\s*$',
+        f'model_provider = "{next_profile}"',
+        text,
+        count=1,
+        flags=re.M,
+    )
+    text = re.sub(
+        r"^\s*\[model_providers\.[^\]]+\]\s*$",
+        f"[model_providers.{next_profile}]",
+        text,
+        count=1,
+        flags=re.M,
+    )
+    text = re.sub(
+        r'^\s*name\s*=\s*"[^"]+"\s*$',
+        f'name = "{next_profile}"',
+        text,
+        count=1,
+        flags=re.M,
+    )
+    text = re.sub(
+        r'^\s*base_url\s*=\s*"[^"]+"\s*$',
+        f'base_url = "{base_url}"',
+        text,
+        count=1,
+        flags=re.M,
+    )
+    if model:
+        text = re.sub(
+            r'^\s*model\s*=\s*"[^"]+"\s*$',
+            f'model = "{model}"',
+            text,
+            count=1,
+            flags=re.M,
+        )
+    return text
+
+
+def apply_profile(profiles_data: dict, next_profile: str) -> None:
+    order, profiles = validate_profiles_data(profiles_data)
+    if next_profile not in order:
+        raise ValueError(f"unknown profile: {next_profile}")
+    profile = profiles[next_profile]
+    if not profile.get("base_url"):
+        raise ValueError(f"profile '{next_profile}' has empty base_url")
+    if not profile.get("api_key"):
+        raise ValueError(f"profile '{next_profile}' has empty api_key")
+    template = (CODEX_DIR / "config.toml").read_text(encoding="utf-8")
+    new_config = render_next_config(
+        template,
+        next_profile=next_profile,
+        base_url=profile["base_url"],
+        model=profile.get("model"),
+    )
+    safe_write_text(CODEX_DIR / "config.toml", new_config, mode=0o600)
+    safe_write_json(CODEX_DIR / "auth.json", {"OPENAI_API_KEY": profile["api_key"]}, mode=0o600)
+    write_current_profile(next_profile)
 
 
 def load_threads() -> dict[str, dict]:
@@ -309,19 +551,37 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
       margin: 0 auto;
       padding: 24px;
     }}
-    .top {{
-      position: sticky;
-      top: 0;
-      backdrop-filter: blur(12px);
-      background: rgba(8, 17, 31, 0.88);
-      border-bottom: 1px solid var(--border);
-      padding: 16px 0 18px;
-      z-index: 5;
-    }}
-    h1 {{
-      margin: 0 0 8px;
-      font-size: 28px;
-    }}
+	    .top {{
+	      position: sticky;
+	      top: 0;
+	      backdrop-filter: blur(12px);
+	      background: rgba(8, 17, 31, 0.88);
+	      border-bottom: 1px solid var(--border);
+	      padding: 16px 0 18px;
+	      z-index: 5;
+	    }}
+	    .nav {{
+	      display: flex;
+	      gap: 12px;
+	      margin: 12px 0 14px;
+	    }}
+	    .nav a {{
+	      color: var(--muted);
+	      text-decoration: none;
+	      border: 1px solid var(--border);
+	      padding: 6px 10px;
+	      border-radius: 10px;
+	      font-size: 13px;
+	    }}
+	    .nav a.active {{
+	      color: var(--text);
+	      border-color: rgba(56, 189, 248, 0.7);
+	      background: rgba(3, 105, 161, 0.18);
+	    }}
+	    h1 {{
+	      margin: 0 0 8px;
+	      font-size: 28px;
+	    }}
     .sub, .stats, .meta, .preview, .path, .empty {{
       color: var(--muted);
       font-size: 13px;
@@ -443,15 +703,19 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
   </style>
 </head>
 <body>
-  <div class="top">
-    <div class="wrap">
-      <h1>Codex Shared History</h1>
-      <div class="sub">Local aggregate view across all sessions on this machine. Generated at {html.escape(generated_at)}.</div>
-      <input id="search" type="search" placeholder="Search title, cwd, provider, prompt, or reply..." />
-      <div class="stats"><span id="visible-count">{len(sessions)}</span> / {len(sessions)} sessions visible</div>
-      {flash_html}
-    </div>
-  </div>
+	  <div class="top">
+	    <div class="wrap">
+	      <h1>Codex Shared History</h1>
+	      <div class="sub">Local aggregate view across all sessions on this machine. Generated at {html.escape(generated_at)}.</div>
+	      <div class="nav">
+	        <a class="active" href="/">History</a>
+	        <a href="/profiles">Profiles</a>
+	      </div>
+	      <input id="search" type="search" placeholder="Search title, cwd, provider, prompt, or reply..." />
+	      <div class="stats"><span id="visible-count">{len(sessions)}</span> / {len(sessions)} sessions visible</div>
+	      {flash_html}
+	    </div>
+	  </div>
   <div class="wrap" id="sessions">
     {cards}
   </div>
@@ -613,6 +877,322 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
 """
 
 
+def render_profiles_html(flash: str = "") -> str:
+    generated_at = dt.datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    flash_html = (
+        f'<div id="flash" class="flash">{html.escape(flash)}</div>'
+        if flash
+        else '<div id="flash" class="flash hidden"></div>'
+    )
+    return f"""<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Codex Profiles</title>
+  <style>
+    :root {{
+      color-scheme: light dark;
+      --bg: #0b1020;
+      --panel: #11182d;
+      --text: #e5e7eb;
+      --muted: #94a3b8;
+      --border: #334155;
+      --danger-bg: rgba(127, 29, 29, 0.35);
+      --flash-bg: rgba(3, 105, 161, 0.25);
+      --flash-border: rgba(56, 189, 248, 0.45);
+    }}
+    body {{
+      margin: 0;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+      background: linear-gradient(180deg, #08111f, #0f172a 30%, #111827);
+      color: var(--text);
+    }}
+    .wrap {{
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px;
+    }}
+    .top {{
+      position: sticky;
+      top: 0;
+      backdrop-filter: blur(12px);
+      background: rgba(8, 17, 31, 0.88);
+      border-bottom: 1px solid var(--border);
+      padding: 16px 0 18px;
+      z-index: 5;
+    }}
+    h1 {{
+      margin: 0 0 8px;
+      font-size: 28px;
+    }}
+    .sub, .meta {{
+      color: var(--muted);
+      font-size: 13px;
+    }}
+    .nav {{
+      display: flex;
+      gap: 12px;
+      margin: 12px 0 14px;
+    }}
+    .nav a {{
+      color: var(--muted);
+      text-decoration: none;
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      border-radius: 10px;
+      font-size: 13px;
+    }}
+    .nav a.active {{
+      color: var(--text);
+      border-color: rgba(56, 189, 248, 0.7);
+      background: rgba(3, 105, 161, 0.18);
+    }}
+    .flash {{
+      margin-top: 14px;
+      border: 1px solid var(--flash-border);
+      background: var(--flash-bg);
+      padding: 10px 12px;
+      border-radius: 10px;
+      color: #dbeafe;
+    }}
+    .panel {{
+      border: 1px solid var(--border);
+      background: rgba(17, 24, 45, 0.94);
+      border-radius: 14px;
+      padding: 16px;
+      margin: 18px 0;
+    }}
+    table {{
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 13px;
+    }}
+    th, td {{
+      text-align: left;
+      border-bottom: 1px solid rgba(51, 65, 85, 0.6);
+      padding: 10px 8px;
+      vertical-align: top;
+    }}
+    th {{
+      color: var(--muted);
+      font-weight: 600;
+    }}
+    input[type="text"], input[type="password"] {{
+      width: 100%;
+      box-sizing: border-box;
+      border: 1px solid var(--border);
+      background: #0f172a;
+      color: var(--text);
+      border-radius: 10px;
+      padding: 10px 12px;
+      font: inherit;
+      font-size: 13px;
+    }}
+    .row-actions {{
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }}
+    button {{
+      border: 1px solid var(--border);
+      background: #0f172a;
+      color: var(--text);
+      border-radius: 10px;
+      padding: 8px 10px;
+      cursor: pointer;
+      font: inherit;
+      font-size: 13px;
+    }}
+    button.primary {{
+      border-color: rgba(56, 189, 248, 0.7);
+      background: rgba(3, 105, 161, 0.18);
+    }}
+    button.danger {{
+      border-color: rgba(239, 68, 68, 0.7);
+      background: var(--danger-bg);
+    }}
+    code {{
+      font-family: inherit;
+      font-size: 12px;
+      padding: 1px 6px;
+      border: 1px solid rgba(51, 65, 85, 0.65);
+      border-radius: 8px;
+      background: rgba(15, 23, 42, 0.8);
+    }}
+    .hidden {{ display: none; }}
+  </style>
+</head>
+<body>
+  <div class="top">
+    <div class="wrap">
+      <h1>Codex Profiles</h1>
+      <div class="sub">Generated at {html.escape(generated_at)} · Writes to <code>{html.escape(str(CSWITCH_PROFILES_FILE))}</code></div>
+      <div class="nav">
+        <a href="/">History</a>
+        <a class="active" href="/profiles">Profiles</a>
+      </div>
+      {flash_html}
+    </div>
+  </div>
+  <div class="wrap">
+    <div class="panel">
+      <div class="row-actions" style="margin-bottom: 12px;">
+        <button id="add" type="button">Add profile</button>
+        <button id="save" class="primary" type="button">Save</button>
+      </div>
+      <div class="meta" id="status"></div>
+      <div style="overflow-x:auto;">
+        <table>
+          <thead>
+            <tr>
+              <th style="width: 130px;">Name</th>
+              <th>Base URL</th>
+              <th>API Key</th>
+              <th style="width: 140px;">Model</th>
+              <th style="width: 220px;">Actions</th>
+            </tr>
+          </thead>
+          <tbody id="rows"></tbody>
+        </table>
+      </div>
+      <div class="meta" style="margin-top: 10px;">API keys are stored in plain text on disk. This UI binds to <code>127.0.0.1</code> only.</div>
+    </div>
+  </div>
+  <script>
+    const $ = (sel) => document.querySelector(sel);
+    const rowsEl = $("#rows");
+    const statusEl = $("#status");
+    const flashEl = $("#flash");
+
+    function setFlash(msg, ok=true) {{
+      flashEl.textContent = msg;
+      flashEl.classList.remove("hidden");
+      flashEl.style.borderColor = ok ? "rgba(56, 189, 248, 0.45)" : "rgba(239, 68, 68, 0.7)";
+      flashEl.style.background = ok ? "rgba(3, 105, 161, 0.25)" : "rgba(127, 29, 29, 0.35)";
+      flashEl.style.color = ok ? "#dbeafe" : "#fecaca";
+    }}
+
+    function escapeHtml(text) {{
+      const div = document.createElement("div");
+      div.innerText = text;
+      return div.innerHTML;
+    }}
+
+    function mkRow(name, profile) {{
+      const tr = document.createElement("tr");
+      tr.innerHTML = `
+        <td><input type="text" class="name" value="${{escapeHtml(name)}}" /></td>
+        <td><input type="text" class="base_url" value="${{escapeHtml(profile.base_url || "")}}" placeholder="https://example.com/v1" /></td>
+        <td><input type="password" class="api_key" value="${{escapeHtml(profile.api_key || "")}}" placeholder="sk-..." /></td>
+        <td><input type="text" class="model" value="${{escapeHtml(profile.model || "")}}" placeholder="gpt-5.4" /></td>
+        <td>
+          <div class="row-actions">
+            <button type="button" class="up">Up</button>
+            <button type="button" class="down">Down</button>
+            <button type="button" class="apply primary">Apply</button>
+            <button type="button" class="remove danger">Remove</button>
+          </div>
+        </td>`;
+      return tr;
+    }}
+
+    function readTable() {{
+      const order = [];
+      const profiles = {{}};
+      for (const tr of rowsEl.querySelectorAll("tr")) {{
+        const name = tr.querySelector(".name").value.trim();
+        if (!name) continue;
+        order.push(name);
+        profiles[name] = {{
+          base_url: tr.querySelector(".base_url").value.trim(),
+          api_key: tr.querySelector(".api_key").value.trim(),
+        }};
+        const model = tr.querySelector(".model").value.trim();
+        if (model) profiles[name].model = model;
+      }}
+      return {{ order, profiles }};
+    }}
+
+    async function load() {{
+      const res = await fetch("/api/profiles");
+      const data = await res.json();
+      rowsEl.innerHTML = "";
+      for (const name of data.order || []) {{
+        const profile = (data.profiles || {{}})[name] || {{}};
+        rowsEl.appendChild(mkRow(name, profile));
+      }}
+      statusEl.textContent = `Current: ${{data.current || ""}}`;
+    }}
+
+    rowsEl.addEventListener("click", async (ev) => {{
+      const btn = ev.target.closest("button");
+      if (!btn) return;
+      const tr = ev.target.closest("tr");
+      if (!tr) return;
+
+      if (btn.classList.contains("remove")) {{
+        tr.remove();
+        return;
+      }}
+      if (btn.classList.contains("up")) {{
+        const prev = tr.previousElementSibling;
+        if (prev) rowsEl.insertBefore(tr, prev);
+        return;
+      }}
+      if (btn.classList.contains("down")) {{
+        const next = tr.nextElementSibling;
+        if (next) rowsEl.insertBefore(next, tr);
+        return;
+      }}
+      if (btn.classList.contains("apply")) {{
+        const name = tr.querySelector(".name").value.trim();
+        if (!name) return;
+        const res = await fetch("/api/profiles/apply", {{
+          method: "POST",
+          headers: {{ "Content-Type": "application/json" }},
+          body: JSON.stringify({{ profile: name }}),
+        }});
+        const out = await res.json();
+        if (out.ok) {{
+          statusEl.textContent = `Current: ${{name}}`;
+          setFlash(out.flash || `Applied ${{name}}`, true);
+        }} else {{
+          setFlash(out.flash || "Apply failed", false);
+        }}
+      }}
+    }});
+
+    $("#add").addEventListener("click", () => {{
+      const name = `profile-${{rowsEl.querySelectorAll("tr").length + 1}}`;
+      rowsEl.appendChild(mkRow(name, {{ base_url: "", api_key: "" }}));
+    }});
+
+    $("#save").addEventListener("click", async () => {{
+      const payload = readTable();
+      const res = await fetch("/api/profiles", {{
+        method: "PUT",
+        headers: {{ "Content-Type": "application/json" }},
+        body: JSON.stringify(payload),
+      }});
+      const out = await res.json();
+      if (out.ok) {{
+        setFlash(out.flash || "Saved", true);
+        await load();
+      }} else {{
+        setFlash(out.flash || "Save failed", false);
+      }}
+    }});
+
+    load().catch((err) => {{
+      setFlash(String(err), false);
+    }});
+  </script>
+</body>
+</html>
+"""
+
+
 def rewrite_jsonl_without_session(path: Path, session_id: str) -> int:
     if not path.exists():
         return 0
@@ -699,22 +1279,88 @@ def build_static_html(output: Path) -> tuple[Path, int]:
 
 
 class HistoryHandler(BaseHTTPRequestHandler):
-    def do_GET(self) -> None:
-        parsed = urllib.parse.urlparse(self.path)
-        if parsed.path != "/":
-            self.send_error(HTTPStatus.NOT_FOUND)
-            return
-        params = urllib.parse.parse_qs(parsed.query)
-        flash = params.get("flash", [""])[0]
-        body = render_html(collect_sessions(), interactive=True, flash=flash).encode("utf-8")
-        self.send_response(HTTPStatus.OK)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
+    def read_json_body(self) -> dict:
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length).decode("utf-8") if length else ""
+        if not raw.strip():
+            return {}
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def write_json(self, payload: dict, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
+    def do_GET(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        flash = params.get("flash", [""])[0]
+        if parsed.path == "/":
+            body = render_html(collect_sessions(), interactive=True, flash=flash).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if parsed.path == "/profiles":
+            body = render_profiles_html(flash=flash).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
+        if parsed.path == "/api/profiles":
+            profiles_data = ensure_profiles_file()
+            try:
+                order, profiles = validate_profiles_data(profiles_data)
+                current = read_current_profile(order)
+                self.write_json({"ok": True, "order": order, "profiles": profiles, "current": current})
+            except Exception as exc:
+                raw_order = profiles_data.get("order", [])
+                raw_profiles = profiles_data.get("profiles", {})
+                current = raw_order[0] if isinstance(raw_order, list) and raw_order else ""
+                self.write_json(
+                    {
+                        "ok": False,
+                        "flash": f"Invalid profiles file: {exc}",
+                        "order": raw_order if isinstance(raw_order, list) else [],
+                        "profiles": raw_profiles if isinstance(raw_profiles, dict) else {},
+                        "current": current,
+                    },
+                    status=400,
+                )
+            return
+
+        self.send_error(HTTPStatus.NOT_FOUND)
+
     def do_POST(self) -> None:
         parsed = urllib.parse.urlparse(self.path)
+        if parsed.path == "/api/profiles/apply":
+            data = self.read_json_body()
+            profile = str(data.get("profile", "")).strip()
+            if not profile:
+                self.write_json({"ok": False, "flash": "Missing profile"}, status=400)
+                return
+            try:
+                profiles_data = ensure_profiles_file()
+                apply_profile(profiles_data, profile)
+            except Exception as exc:
+                self.write_json({"ok": False, "flash": f"Apply failed: {exc}"}, status=400)
+                return
+            self.write_json({"ok": True, "flash": f"Applied profile: {profile}"})
+            return
+
         if parsed.path not in {"/delete", "/rename"}:
             self.send_error(HTTPStatus.NOT_FOUND)
             return
@@ -745,6 +1391,20 @@ class HistoryHandler(BaseHTTPRequestHandler):
             f"session_index rows={result['removed_index']}, history rows={result['removed_history']}"
         )
         self.respond_result(flash, ok=True)
+
+    def do_PUT(self) -> None:
+        parsed = urllib.parse.urlparse(self.path)
+        if parsed.path != "/api/profiles":
+            self.send_error(HTTPStatus.NOT_FOUND)
+            return
+        data = self.read_json_body()
+        try:
+            order, profiles = validate_profiles_data(data)
+        except Exception as exc:
+            self.write_json({"ok": False, "flash": f"Invalid profiles: {exc}"}, status=400)
+            return
+        safe_write_json(CSWITCH_PROFILES_FILE, {"order": order, "profiles": profiles}, mode=0o600)
+        self.write_json({"ok": True, "flash": "Saved profiles"})
 
     def redirect_with_flash(self, message: str) -> None:
         location = "/?flash=" + urllib.parse.quote(message)
@@ -784,9 +1444,13 @@ def maybe_open_browser(url: str) -> None:
 
 
 def serve_history(port: int, open_browser: bool) -> int:
+    return serve_ui(port=port, open_browser=open_browser, open_path="/")
+
+
+def serve_ui(port: int, open_browser: bool, open_path: str) -> int:
     server = ThreadingHTTPServer(("127.0.0.1", port), HistoryHandler)
     actual_port = server.server_address[1]
-    url = f"http://127.0.0.1:{actual_port}/"
+    url = f"http://127.0.0.1:{actual_port}{open_path}"
     print(f"serving {url}")
     if open_browser:
         threading.Timer(0.2, lambda: maybe_open_browser(url)).start()
@@ -799,14 +1463,14 @@ def serve_history(port: int, open_browser: bool) -> int:
     return 0
 
 
-def main() -> int:
+def main_history(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description="Local Codex shared history viewer")
     parser.add_argument("--build", action="store_true", help="Build a static HTML snapshot instead of serving")
     parser.add_argument("--output", default=str(OUTPUT_HTML), help="Output HTML path for --build")
     parser.add_argument("--serve", action="store_true", help="Serve an interactive local UI")
     parser.add_argument("--port", type=int, default=8765, help="Port for --serve (default: 8765)")
     parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if args.build:
         output, count = build_static_html(Path(args.output).expanduser())
@@ -814,10 +1478,72 @@ def main() -> int:
         print(f"sessions: {count}")
         return 0
 
-    if args.serve or not args.build:
-        return serve_history(port=args.port, open_browser=not args.no_open)
+    return serve_ui(port=args.port, open_browser=not args.no_open, open_path="/")
 
+
+def main_profiles(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = argparse.ArgumentParser(description="Local Codex profile editor")
+    parser.add_argument("--port", type=int, default=8766, help="Port for UI (default: 8766)")
+    parser.add_argument("--no-open", action="store_true", help="Do not open the browser automatically")
+    args = parser.parse_args(argv)
+    return serve_ui(port=args.port, open_browser=not args.no_open, open_path="/profiles")
+
+
+def main_cswitch(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    parser = argparse.ArgumentParser(prog="cswitch", description="Switch Codex config by profile")
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=("switch", "status", "list", "set", "init"),
+        default="switch",
+        help="switch: go to next profile; status: show current; list: show all; set: apply a profile; init: create profiles JSON",
+    )
+    parser.add_argument("profile", nargs="?", help="Profile name for 'set'")
+    args = parser.parse_args(argv)
+
+    profiles_data = ensure_profiles_file()
+    order, _profiles = validate_profiles_data(profiles_data)
+
+    if args.action == "init":
+        print(str(CSWITCH_PROFILES_FILE))
+        return 0
+
+    current = read_current_profile(order)
+
+    if args.action == "status":
+        print(f"当前使用的配置：{current}")
+        return 0
+
+    if args.action == "list":
+        for name in order:
+            marker = "*" if name == current else " "
+            print(f"{marker} {name}")
+        return 0
+
+    if args.action == "set":
+        if not args.profile:
+            parser.error("missing profile name for 'set'")
+        apply_profile(profiles_data, args.profile)
+        print(f"当前使用的配置：{args.profile}")
+        return 0
+
+    next_profile = order[(order.index(current) + 1) % len(order)]
+    apply_profile(profiles_data, next_profile)
+    print(f"当前使用的配置：{next_profile}")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    argv = argv if argv is not None else sys.argv[1:]
+    if argv and argv[0] == "profiles":
+        return main_profiles(argv[1:])
+    if argv and argv[0] == "cswitch":
+        return main_cswitch(argv[1:])
+    if argv and argv[0] == "history":
+        return main_history(argv[1:])
+    return main_history(argv)
 
 
 if __name__ == "__main__":

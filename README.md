@@ -9,6 +9,8 @@ It provides:
 - in-place record deletion without page jump
 - in-place title renaming
 - a static HTML export mode
+- a local web UI for editing Codex API profiles (endpoints + keys)
+- a `cswitch` command for switching profiles
 
 ## What Is `pipx`
 
@@ -61,6 +63,11 @@ bash /Users/liiilhhh/Downloads/codex-history/install.sh
 
 This copies the tool to `~/.local/share/codex-history/` and writes a wrapper to `~/.local/bin/codex-history`.
 
+It also installs:
+
+- `~/.local/bin/cswitch`
+- `~/.local/bin/codex-profiles`
+
 ## Usage
 
 Start the local history UI:
@@ -69,12 +76,34 @@ Start the local history UI:
 codex-history
 ```
 
+Start the local profile editor UI:
+
+```bash
+codex-profiles
+```
+
+Switch Codex profiles (endpoint + key) using `~/.codex/cswitch_profiles.json`:
+
+```bash
+cswitch status
+cswitch list
+cswitch switch
+cswitch set tokenflux
+```
+
 Useful flags:
 
 ```bash
 codex-history --no-open
 codex-history --port 9876
 codex-history --build
+```
+
+For `codex-profiles`:
+
+```bash
+codex-profiles --no-open
+codex-profiles --port 8766
 ```
 
 Static export goes to:

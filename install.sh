@@ -6,6 +6,8 @@ TARGET_ROOT="${HOME}/.local/share/${APP_NAME}"
 TARGET_BIN_DIR="${HOME}/.local/bin"
 TARGET_CLI="${TARGET_ROOT}/codex_history.py"
 TARGET_WRAPPER="${TARGET_BIN_DIR}/${APP_NAME}"
+TARGET_CSWITCH="${TARGET_BIN_DIR}/cswitch"
+TARGET_PROFILES="${TARGET_BIN_DIR}/codex-profiles"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd 2>/dev/null || true)"
 LOCAL_SOURCE="${SCRIPT_DIR}/src/codex_history/cli.py"
@@ -43,8 +45,24 @@ EOF
 
 chmod +x "${TARGET_WRAPPER}"
 
+cat > "${TARGET_CSWITCH}" <<'EOF'
+#!/usr/bin/env bash
+exec python3 "$HOME/.local/share/codex-history/codex_history.py" cswitch "$@"
+EOF
+
+chmod +x "${TARGET_CSWITCH}"
+
+cat > "${TARGET_PROFILES}" <<'EOF'
+#!/usr/bin/env bash
+exec python3 "$HOME/.local/share/codex-history/codex_history.py" profiles "$@"
+EOF
+
+chmod +x "${TARGET_PROFILES}"
+
 echo "Installed ${APP_NAME}"
 echo "CLI script: ${TARGET_CLI}"
-echo "Wrapper:    ${TARGET_WRAPPER}"
+echo "Wrappers:   ${TARGET_WRAPPER}"
+echo "            ${TARGET_CSWITCH}"
+echo "            ${TARGET_PROFILES}"
 echo
 echo "If '${APP_NAME}' is not found immediately, add ~/.local/bin to PATH or restart your shell."
