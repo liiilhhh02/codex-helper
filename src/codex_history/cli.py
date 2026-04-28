@@ -27,6 +27,7 @@ ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
 OUTPUT_DIR = CODEX_DIR / "memories" / "shared_history"
 OUTPUT_HTML = OUTPUT_DIR / "index.html"
 JUNK_AGE_DAYS = 90
+UNIFIED_PROVIDER_NAME = "user"
 
 CSWITCH_STATE_FILE = Path.home() / ".local" / "state" / "cswitch" / "current_profile"
 CSWITCH_PROFILES_FILE = CODEX_DIR / "cswitch_profiles.json"
@@ -116,6 +117,85 @@ def read_model_from_config(path: Path) -> str:
     text = path.read_text(encoding="utf-8")
     match = re.search(r'^\s*model\s*=\s*"([^"]+)"\s*$', text, flags=re.M)
     return match.group(1).strip() if match else ""
+
+
+def iter_codex_config_files() -> list[Path]:
+    return sorted(path for path in CODEX_DIR.glob("config*.toml") if path.is_file())
+
+
+def normalize_config_provider_name(path: Path) -> bool:
+    if not path.exists():
+        return False
+    original = path.read_text(encoding="utf-8")
+    updated = re.sub(
+        r'(^\s*name\s*=\s*)"[^"]+"(\s*$)',
+        rf'\1"{UNIFIED_PROVIDER_NAME}"\2',
+        original,
+        flags=re.M,
+    )
+    if updated == original:
+        return False
+    safe_write_text(path, updated, mode=0o600)
+    return True
+
+
+def rewrite_jsonl_records(path: Path, transform) -> int:
+    if not path.exists():
+        return 0
+
+    changed = 0
+    rewritten: list[str] = []
+    with path.open("r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.rstrip("\n")
+            if not line:
+                rewritten.append(raw_line)
+                continue
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                rewritten.append(raw_line)
+                continue
+
+            next_row = transform(row)
+            if next_row is None:
+                rewritten.append(raw_line)
+                continue
+            rewritten.append(json.dumps(next_row, ensure_ascii=False) + "\n")
+            changed += 1
+
+    if changed:
+        safe_write_text(path, "".join(rewritten))
+    return changed
+
+
+def rewrite_session_provider_name(path: Path) -> int:
+    def transform(row: dict) -> dict | None:
+        if row.get("type") != "session_meta":
+            return None
+        payload = row.get("payload")
+        if not isinstance(payload, dict):
+            return None
+        if payload.get("model_provider") == UNIFIED_PROVIDER_NAME:
+            return None
+        next_row = dict(row)
+        next_payload = dict(payload)
+        next_payload["model_provider"] = UNIFIED_PROVIDER_NAME
+        next_row["payload"] = next_payload
+        return next_row
+
+    return rewrite_jsonl_records(path, transform)
+
+
+def migrate_codex_provider_state() -> None:
+    for path in iter_codex_config_files():
+        normalize_config_provider_name(path)
+
+    for base in (SESSIONS_DIR, ARCHIVED_SESSIONS_DIR):
+        if not base.exists():
+            continue
+        for path in base.rglob("rollout-*.jsonl"):
+            rewrite_session_provider_name(path)
 
 
 def resolve_alt_auth(codex_dir: Path) -> Path | None:
@@ -224,7 +304,7 @@ def render_next_config(template_text: str, *, next_profile: str, base_url: str, 
     )
     text = re.sub(
         r'^\s*name\s*=\s*"[^"]+"\s*$',
-        f'name = "{next_profile}"',
+        f'name = "{UNIFIED_PROVIDER_NAME}"',
         text,
         count=1,
         flags=re.M,
@@ -562,6 +642,7 @@ def render_session_card(session: dict, interactive: bool) -> str:
     body = "".join(transcript_html) or '<div class="empty">No transcript captured.</div>'
     junk_value = "1" if session["is_junk"] else "0"
     subagent_value = "1" if session["is_subagent"] else "0"
+    resume_command = f'codex resume {session["id"]}'
 
     return "\n".join(
         [
@@ -572,7 +653,12 @@ def render_session_card(session: dict, interactive: bool) -> str:
             "</summary>",
             f'<div class="preview">{html.escape(session["preview"])}</div>' if session["preview"] else '<div class="preview muted">No preview</div>',
             f'<div class="path">{html.escape(session["path"])}</div>',
-            f'<div class="path">run <code>codex resume {html.escape(session["id"])}</code></div>',
+            (
+                '<div class="path resume-command">'
+                f'<code>{html.escape(resume_command)}</code>'
+                f'<button type="button" class="neutral copy-resume" data-copy-text="{html.escape(resume_command, quote=True)}">Copy</button>'
+                "</div>"
+            ),
             controls,
             body,
             "</details>",
@@ -701,6 +787,15 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
     .path {{
       margin: 8px 0 14px;
       word-break: break-all;
+    }}
+    .resume-command {{
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+    }}
+    .resume-command code {{
+      padding: 2px 0;
     }}
     .preview {{
       margin-bottom: 8px;
@@ -906,6 +1001,23 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
       selectedCount.textContent = String(getSelectedIds().length);
     }}
 
+    async function copyText(text) {{
+      if (navigator.clipboard && navigator.clipboard.writeText) {{
+        await navigator.clipboard.writeText(text);
+        return;
+      }}
+
+      const input = document.createElement('textarea');
+      input.value = text;
+      input.setAttribute('readonly', '');
+      input.style.position = 'absolute';
+      input.style.left = '-9999px';
+      document.body.appendChild(input);
+      input.select();
+      document.execCommand('copy');
+      document.body.removeChild(input);
+    }}
+
     function visibleCards() {{
       return sessions.filter((card) => !card.classList.contains('hidden'));
     }}
@@ -988,6 +1100,31 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
         .filter(Boolean);
       await deleteIds(ids, 'Delete junk');
     }});
+
+    for (const button of document.querySelectorAll('.copy-resume')) {{
+      button.addEventListener('click', async () => {{
+        const text = button.dataset.copyText || '';
+        if (!text) {{
+          setFlash('Missing resume command', true);
+          return;
+        }}
+
+        const originalText = button.textContent || 'Copy';
+        button.disabled = true;
+        try {{
+          await copyText(text);
+          button.textContent = 'Copied';
+          setFlash(`Copied: ${{text}}`);
+        }} catch (error) {{
+          setFlash(error.message || 'Copy failed', true);
+        }} finally {{
+          window.setTimeout(() => {{
+            button.disabled = false;
+            button.textContent = originalText;
+          }}, 900);
+        }}
+      }});
+    }}
 
     for (const button of document.querySelectorAll('.rename-button')) {{
       button.addEventListener('click', async () => {{
@@ -1921,6 +2058,7 @@ def main_cswitch(argv: list[str] | None = None) -> int:
 
 def main(argv: list[str] | None = None) -> int:
     argv = argv if argv is not None else sys.argv[1:]
+    migrate_codex_provider_state()
     if argv and argv[0] == "profiles":
         return main_profiles(argv[1:])
     if argv and argv[0] == "cswitch":
