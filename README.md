@@ -18,6 +18,7 @@ It is designed for one job: make old Codex conversations easier to browse, clean
 - Hide subagent sessions by default
 - Export a static HTML snapshot
 - Pick a past session and run `codex resume <id>`
+- Summarize a session with DeepSeek from the history web UI
 - Edit Codex API profiles in a local web UI
 - Switch profiles with `cswitch`
 
@@ -29,6 +30,7 @@ It is designed for one job: make old Codex conversations easier to browse, clean
 - 默认隐藏 subagent 对话
 - 导出静态 HTML 历史页
 - 从历史中选择会话并执行 `codex resume <id>`
+- 在历史网页里用 DeepSeek 总结单条会话
 - 在网页中编辑 Codex API profiles
 - 使用 `cswitch` 切换 profile
 
@@ -205,6 +207,42 @@ The history page supports:
 - 批量删除垃圾会话
 - 默认隐藏 subagent 会话
 - 每条展开后显示一行小字提示：`run codex resume <session_id>`
+
+### DeepSeek summaries / DeepSeek 会话总结
+
+The history page has a `Summarize` button on each session. It calls DeepSeek's OpenAI-compatible chat completions API and stores summary cache files locally.
+
+历史页每条会话都有 `Summarize` 按钮，会调用 DeepSeek 的 OpenAI 兼容 Chat Completions API，并把总结缓存到本机。
+
+Configure the API here:
+
+API 在这里配置：
+
+```text
+~/.codex/deepseek_summary.json
+```
+
+Example:
+
+示例：
+
+```json
+{
+  "base_url": "https://api.deepseek.com",
+  "api_key": "sk-your-deepseek-key",
+  "model": "deepseek-v4-flash",
+  "max_input_chars": 60000,
+  "max_output_tokens": 1200
+}
+```
+
+Summary cache files are written under:
+
+总结缓存写在这里：
+
+```text
+~/.codex/memories/codex_history_summaries/
+```
 
 Current junk-session heuristics:
 

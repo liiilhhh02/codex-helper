@@ -11,6 +11,8 @@ import re
 import subprocess
 import threading
 import urllib.parse
+import urllib.request
+import urllib.error
 import webbrowser
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -26,8 +28,14 @@ SESSIONS_DIR = CODEX_DIR / "sessions"
 ARCHIVED_SESSIONS_DIR = CODEX_DIR / "archived_sessions"
 OUTPUT_DIR = CODEX_DIR / "memories" / "shared_history"
 OUTPUT_HTML = OUTPUT_DIR / "index.html"
+SUMMARY_CONFIG_FILE = CODEX_DIR / "deepseek_summary.json"
+SUMMARY_CACHE_DIR = CODEX_DIR / "memories" / "codex_history_summaries"
 JUNK_AGE_DAYS = 90
 UNIFIED_PROVIDER_NAME = "user"
+DEFAULT_SUMMARY_MODEL = "deepseek-v4-flash"
+DEFAULT_SUMMARY_BASE_URL = "https://api.deepseek.com"
+DEFAULT_SUMMARY_MAX_INPUT_CHARS = 60000
+DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS = 1200
 
 CSWITCH_STATE_FILE = Path.home() / ".local" / "state" / "cswitch" / "current_profile"
 CSWITCH_PROFILES_FILE = CODEX_DIR / "cswitch_profiles.json"
@@ -49,6 +57,15 @@ def safe_write_text(path: Path, content: str, *, mode: int | None = None) -> Non
 
 def safe_write_json(path: Path, obj: object, *, mode: int | None = None) -> None:
     safe_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2) + "\n", mode=mode)
+
+
+def safe_read_json(path: Path) -> object | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
 
 
 def load_json(path: Path) -> dict:
@@ -594,6 +611,204 @@ def collect_sessions(*, include_subagents: bool = True) -> list[dict]:
     return sessions
 
 
+def find_session(session_id: str) -> dict | None:
+    session_id = session_id.strip()
+    if not session_id:
+        return None
+    thread_map = load_threads()
+    for path in iter_session_files():
+        session = parse_session(path, None)
+        if not session or session.get("id") != session_id:
+            continue
+        meta = thread_map.get(session_id)
+        if meta:
+            session["title"] = stringify(meta.get("title") or session["title"])
+            session["updated_iso"] = stringify(meta.get("updated_iso") or session["updated_iso"])
+        return session
+    return None
+
+
+def default_summary_config() -> dict[str, object]:
+    return {
+        "base_url": DEFAULT_SUMMARY_BASE_URL,
+        "api_key": "",
+        "model": DEFAULT_SUMMARY_MODEL,
+        "max_input_chars": DEFAULT_SUMMARY_MAX_INPUT_CHARS,
+        "max_output_tokens": DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS,
+    }
+
+
+def ensure_summary_config_file() -> dict:
+    raw = load_json(SUMMARY_CONFIG_FILE)
+    if not raw:
+        config = default_summary_config()
+        safe_write_json(SUMMARY_CONFIG_FILE, config, mode=0o600)
+        return config
+    config = default_summary_config()
+    config.update({key: value for key, value in raw.items() if value is not None})
+    return config
+
+
+def validate_summary_config(raw: dict) -> dict:
+    config = default_summary_config()
+    config.update(raw)
+    base_url = stringify(config.get("base_url")).strip().rstrip("/")
+    api_key = stringify(config.get("api_key")).strip()
+    model = stringify(config.get("model")).strip()
+    if not base_url:
+        raise ValueError("missing base_url")
+    if not api_key:
+        raise ValueError(f"missing api_key in {SUMMARY_CONFIG_FILE}")
+    if not model:
+        raise ValueError("missing model")
+    try:
+        max_input_chars = int(config.get("max_input_chars") or DEFAULT_SUMMARY_MAX_INPUT_CHARS)
+    except (TypeError, ValueError):
+        max_input_chars = DEFAULT_SUMMARY_MAX_INPUT_CHARS
+    try:
+        max_output_tokens = int(config.get("max_output_tokens") or DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS)
+    except (TypeError, ValueError):
+        max_output_tokens = DEFAULT_SUMMARY_MAX_OUTPUT_TOKENS
+    return {
+        "base_url": base_url,
+        "api_key": api_key,
+        "model": model,
+        "max_input_chars": max(4000, max_input_chars),
+        "max_output_tokens": max(256, max_output_tokens),
+    }
+
+
+def summary_cache_path(session_id: str) -> Path:
+    safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", session_id).strip("._") or "session"
+    return SUMMARY_CACHE_DIR / f"{safe_name}.json"
+
+
+def load_summary_cache(session_id: str) -> dict | None:
+    data = safe_read_json(summary_cache_path(session_id))
+    return data if isinstance(data, dict) else None
+
+
+def write_summary_cache(session_id: str, payload: dict) -> None:
+    safe_write_json(summary_cache_path(session_id), payload, mode=0o600)
+
+
+def session_content_signature(session: dict) -> str:
+    parts = [
+        stringify(session.get("id")),
+        stringify(session.get("updated_iso")),
+        stringify(session.get("title")),
+        str(len(session.get("transcript", []))),
+    ]
+    return "|".join(parts)
+
+
+def format_transcript_for_summary(session: dict, max_chars: int) -> str:
+    lines = [
+        f"Title: {stringify(session.get('title'))}",
+        f"Session ID: {stringify(session.get('id'))}",
+        f"Updated: {stringify(session.get('updated_iso'))}",
+        f"CWD: {stringify(session.get('cwd'))}",
+        "",
+        "Transcript:",
+    ]
+    for index, item in enumerate(session.get("transcript", []), start=1):
+        role = stringify(item.get("role"))
+        text = stringify(item.get("text")).strip()
+        if not text:
+            continue
+        lines.append(f"\n[{index}] {role}\n{text}")
+    transcript = "\n".join(lines).strip()
+    if len(transcript) <= max_chars:
+        return transcript
+    head_chars = max_chars * 2 // 3
+    tail_chars = max_chars - head_chars
+    return (
+        transcript[:head_chars].rstrip()
+        + "\n\n[... middle of transcript omitted to fit summary input limit ...]\n\n"
+        + transcript[-tail_chars:].lstrip()
+    )
+
+
+def build_summary_messages(session: dict, max_input_chars: int) -> list[dict[str, str]]:
+    transcript = format_transcript_for_summary(session, max_input_chars)
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You summarize local Codex conversation history. "
+                "Write in the same main language used by the user unless the transcript is mixed. "
+                "Return concise Markdown only. Extract the real work thread, not every turn."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                "Summarize this Codex conversation into a compact set of mainlines. "
+                "There may be multiple mainlines. For each mainline include: goal, key decisions, "
+                "files or commands touched when visible, current status, and concrete next step if any. "
+                "Keep it short and useful for resuming later.\n\n"
+                + transcript
+            ),
+        },
+    ]
+
+
+def call_deepseek_summary(session: dict, *, force: bool = False) -> dict:
+    signature = session_content_signature(session)
+    if not force:
+        cached = load_summary_cache(session["id"])
+        if cached and cached.get("signature") == signature and cached.get("summary"):
+            return cached
+
+    config = validate_summary_config(ensure_summary_config_file())
+    url = f"{config['base_url']}/chat/completions"
+    body = {
+        "model": config["model"],
+        "messages": build_summary_messages(session, int(config["max_input_chars"])),
+        "temperature": 0.2,
+        "max_tokens": int(config["max_output_tokens"]),
+    }
+    data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": f"Bearer {config['api_key']}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")[:600]
+        raise RuntimeError(f"DeepSeek API error {exc.code}: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"DeepSeek request failed: {exc.reason}") from exc
+
+    choices = payload.get("choices") if isinstance(payload, dict) else None
+    if not isinstance(choices, list) or not choices:
+        raise RuntimeError("DeepSeek response did not include choices")
+    message = choices[0].get("message") if isinstance(choices[0], dict) else None
+    summary = message.get("content") if isinstance(message, dict) else ""
+    summary = summary.strip() if isinstance(summary, str) else ""
+    if not summary:
+        raise RuntimeError("DeepSeek response was empty")
+
+    result = {
+        "session_id": session["id"],
+        "title": session["title"],
+        "signature": signature,
+        "model": config["model"],
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "summary": summary,
+    }
+    write_summary_cache(session["id"], result)
+    return result
+
+
 def role_label(role: str) -> tuple[str, str]:
     mapping = {
         "user": ("User", "user"),
@@ -629,6 +844,7 @@ def render_session_card(session: dict, interactive: bool) -> str:
                 f'<label class="pick"><input type="checkbox" class="session-pick" data-session-id="{html.escape(session["id"], quote=True)}" /> Select</label>',
                 f'<div class="control-tags">{junk_labels}{subagent_label}</div>',
                 f'<button type="button" class="neutral rename-button" data-session-id="{html.escape(session["id"], quote=True)}">Rename title</button>',
+                f'<button type="button" class="neutral summarize-button" data-session-id="{html.escape(session["id"], quote=True)}">Summarize</button>',
                 f'<form method="post" action="/delete" class="delete-form" data-session-id="{html.escape(session["id"], quote=True)}">',
                 f'<input type="hidden" name="session_id" value="{html.escape(session["id"], quote=True)}" />',
                 '<button type="submit" class="danger">Delete record</button>',
@@ -643,6 +859,19 @@ def render_session_card(session: dict, interactive: bool) -> str:
     junk_value = "1" if session["is_junk"] else "0"
     subagent_value = "1" if session["is_subagent"] else "0"
     resume_command = f'codex resume {session["id"]}'
+    cached_summary = load_summary_cache(session["id"]) if interactive else None
+    summary_text = cached_summary.get("summary", "") if isinstance(cached_summary, dict) else ""
+    summary_html = "\n".join(
+        [
+            '<div class="summary-box hidden" data-role="summary-box">',
+            '<div class="summary-head">',
+            '<span>DeepSeek summary</span>',
+            '<button type="button" class="neutral force-summarize" data-role="force-summarize">Refresh</button>',
+            "</div>",
+            f'<pre data-role="summary-text">{html.escape(summary_text)}</pre>',
+            "</div>",
+        ]
+    )
 
     return "\n".join(
         [
@@ -660,6 +889,7 @@ def render_session_card(session: dict, interactive: bool) -> str:
                 "</div>"
             ),
             controls,
+            summary_html if interactive else "",
             body,
             "</details>",
         ]
@@ -865,6 +1095,24 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
       color: #cbd5e1;
       font-size: 12px;
       margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }}
+    .summary-box {{
+      border: 1px solid rgba(56, 189, 248, 0.28);
+      background: rgba(3, 105, 161, 0.14);
+      border-radius: 10px;
+      padding: 12px;
+      margin: 10px 0 14px;
+    }}
+    .summary-head {{
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      color: #dbeafe;
+      font-size: 12px;
+      margin-bottom: 10px;
       text-transform: uppercase;
       letter-spacing: 0.04em;
     }}
@@ -1123,6 +1371,68 @@ def render_html(sessions: list[dict], interactive: bool, flash: str = "") -> str
             button.textContent = originalText;
           }}, 900);
         }}
+      }});
+    }}
+
+    async function summarizeCard(card, button, force = false) {{
+      const sessionId = card.dataset.sessionId || '';
+      if (!sessionId) {{
+        setFlash('Missing session id', true);
+        return;
+      }}
+
+      const summaryBox = card.querySelector('[data-role="summary-box"]');
+      const summaryText = card.querySelector('[data-role="summary-text"]');
+      if (!summaryBox || !summaryText) {{
+        setFlash('Missing summary container', true);
+        return;
+      }}
+
+      const originalText = button.textContent || 'Summarize';
+      button.disabled = true;
+      button.textContent = force ? 'Refreshing...' : 'Summarizing...';
+      summaryBox.classList.remove('hidden');
+      if (!summaryText.textContent.trim() || force) {{
+        summaryText.textContent = 'Waiting for DeepSeek...';
+      }}
+
+      try {{
+        const response = await fetch('/api/summarize', {{
+          method: 'POST',
+          headers: {{
+            'Content-Type': 'application/json',
+            'Accept': 'application/json'
+          }},
+          body: JSON.stringify({{ session_id: sessionId, force }})
+        }});
+        const payload = await response.json();
+        if (!response.ok || !payload.ok) {{
+          throw new Error(payload.flash || `Summarize failed (${{response.status}})`);
+        }}
+        summaryText.textContent = payload.summary || '';
+        setFlash(payload.flash || `Summarized ${{sessionId}}`);
+      }} catch (error) {{
+        summaryText.textContent = error.message || 'Summarize failed';
+        setFlash(error.message || 'Summarize failed', true);
+      }} finally {{
+        button.disabled = false;
+        button.textContent = originalText;
+      }}
+    }}
+
+    for (const button of document.querySelectorAll('.summarize-button')) {{
+      button.addEventListener('click', async () => {{
+        const card = button.closest('.session');
+        if (!card) return;
+        await summarizeCard(card, button, false);
+      }});
+    }}
+
+    for (const button of document.querySelectorAll('[data-role="force-summarize"]')) {{
+      button.addEventListener('click', async () => {{
+        const card = button.closest('.session');
+        if (!card) return;
+        await summarizeCard(card, button, true);
       }});
     }}
 
@@ -1835,6 +2145,14 @@ class HistoryHandler(BaseHTTPRequestHandler):
                 )
             return
 
+        if parsed.path == "/api/summary-config":
+            config = ensure_summary_config_file()
+            safe_config = dict(config)
+            safe_config["api_key"] = bool(stringify(safe_config.get("api_key")).strip())
+            safe_config["path"] = str(SUMMARY_CONFIG_FILE)
+            self.write_json({"ok": True, "config": safe_config})
+            return
+
         self.send_error(HTTPStatus.NOT_FOUND)
 
     def do_POST(self) -> None:
@@ -1852,6 +2170,33 @@ class HistoryHandler(BaseHTTPRequestHandler):
                 self.write_json({"ok": False, "flash": f"Apply failed: {exc}"}, status=400)
                 return
             self.write_json({"ok": True, "flash": f"Applied profile: {profile}"})
+            return
+
+        if parsed.path == "/api/summarize":
+            data = self.read_json_body()
+            session_id = str(data.get("session_id", "")).strip()
+            force = bool(data.get("force"))
+            if not session_id:
+                self.write_json({"ok": False, "flash": "Missing session_id"}, status=400)
+                return
+            session = find_session(session_id)
+            if not session:
+                self.write_json({"ok": False, "flash": f"Session not found: {session_id}"}, status=404)
+                return
+            try:
+                result = call_deepseek_summary(session, force=force)
+            except Exception as exc:
+                self.write_json({"ok": False, "flash": str(exc), "config_path": str(SUMMARY_CONFIG_FILE)}, status=400)
+                return
+            self.write_json(
+                {
+                    "ok": True,
+                    "flash": f"Summary ready: {session_id}",
+                    "summary": result["summary"],
+                    "created_at": result["created_at"],
+                    "model": result["model"],
+                }
+            )
             return
 
         if parsed.path == "/bulk-delete":
